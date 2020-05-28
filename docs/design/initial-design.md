@@ -330,6 +330,41 @@ etc.)
 
 ## Other Open issues to address:
 
+- Possible alternate design approach: Instead of watching for
+  `DataMoverBackup` resources, the Data Mover controller could watch
+  CSI snapshots instead. It depends on whether we want a
+  "backup-centric" approach, or a "PV/snapshot-centric" approach. The
+  explicit "back this up" approach allows the user to group PVCs and
+  explicitly call out storage locations. It also allows users to be
+  selective about which PVs get backed up into the defined
+  `StorageLocation`. The alternative would be to configure the
+  controller with a storage location to use for all snapshots, and
+  then back up one PVC at a time (for every PVC in the cluster for
+  which CSI snapshots are being taken) from the controller. This will
+  complicate restores, though, as there's no longer a backup ID to use
+  to pull volumes out to restore. We could key restores off namespaced
+  name of PVC, although this could be a problem with multiple clusters
+  (and multiple backups per PVC). We could key it off "PVC namespaced
+  name+source cluster ID", but I think this ultimately comes down to
+  what does the restore use case look like. Is it better for a user to
+  choose a backup operation and (optionally) backed-up volumes within
+  it, or is better to choose volumes by some other means and drop the
+  notion of a `DataMoverBackup` -- I assume we'll still need the
+  `DataMoverRestore`, but in the "no backup resource" case, the
+  restore would just take a list of "backed up volume"
+  references. This goes back to how we identify the backups at backup
+  time, and how we locate them at restore time. The other challenge is
+  the question of plugins. With an explicit `DataMoverBackup`
+  resource, the way of selecting PVCs for restore is plugin-agnostic,
+  but if the only artifact of backing up is what the plugin creates in
+  the `BackupLocation`, then we're relying on the actions of the
+  plugin for the definition of the identifier that the main controller
+  takes as an argument for restore. In any case, we have a few options
+  for this identifier:
+  - Namespaced name of PVC (doesn't account for multiple backups)
+  - Namespaced name of CSI snapshot
+￼ - UID of the above
+  - some combination
 - ceph/ocs API concerns: change block tracking, incremental
   snapshotting (if relevant). This may be outside the Data Mover scope
   if we assume snapshots already exist.

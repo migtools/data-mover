@@ -14,6 +14,79 @@ Data Mover combines the advantages of both approaches. In addition, it
 will allow an alternate Data Mover plugin to be used instead of the
 Restic plugin to meet additional user requirements.
 
+## High level design
+
+### Goals
+
+- Back up volumes with limited downtime
+- Provider-independent backup and restore (restore isn't limited to
+  same volume type as backup)
+- Make use of existing infrastructure for creating CSI snapshots
+  (velero, manual snapshot creation, other backup instrastructure)
+- Support plugins for different backup implementations
+- Backups stored outside of cluster (plugin-specific)
+- Does not require velero to be present
+
+### Approach
+
+1. Create a configuration which instructs DataMover to watch
+   VolumeSnapshots for a given criteria and where to copy the data.
+   - Storage location
+     - Should this be a reference to separate StorageLocation CRD
+       (which would allow reuse), or should it just be fields on the
+       Data Mover configuration?
+   - VolumeSnapshot (CSI snapshots) selection criteria for backing up
+     - Back up everything
+     - Everything in a list of namespaces
+     - Label selectors
+2. For a matched VolumeSnapshot, create a new PV/PVC that is initiated
+   from the referenced Snapshot
+3. Mount the PV in a Pod to handle the copying
+   - Assume the image the Pod runs is the 'backup plugin', perhaps a
+     simple contract of mount the PV at a given location and mount the
+     snapshot metadata at a specific file location in the container
+   - Communicate status/errors/progress via some method to be defined,
+     maybe the container sends a curl command to update status of a
+     specific CR for info
+4. To restore, create a Restore CR which references which volumes to
+   restore.
+   Open question: What methods of volume selection are supported?
+   - Specifying VolumeSnapshots (namespaced name? other key?)
+   - Specifying PVCs (namespaced name? Always use latest snapshot for
+     name?)
+   - Specifying namespaces (restore latest snapshot of each named PVC)
+   - Using LabelSelectors (latest snapshot of each matching PVC)
+   Open question: Do we support renaming PVCs and/or remapping
+   namespaces on restore? Other changes? (storageclass, size, etc.)
+5. Query the golang plugin to get a full list of matching
+   snapshots/PVCs to restore.
+6. For each returned backed-up PVC, create a new empty PV/PVC with the
+   appropriate namespace/name/size/etc. for restore.
+7. Mount the PV in a Pod to handle the copying
+   - Assume the image the Pod runs is the 'restore plugin'
+   - Communicate status/errors/progress via some method to be defined,
+     maybe the container sends a curl command to update status of a
+     specific CR for info
+
+### Plugin approach
+
+We have two basic options for the plugin approach, in terms of what
+sort of interface we will require/
+
+First, it could be a light weight interface that is essentially,
+Vendor provides an image and we will run it. We will mount a PV(s) to
+it and pass in needed info, otherwise it's up to vendor to do what
+they like and use any technology they like. This approach will require
+a small golang plugin on the restore side to implement a query
+interface which will be needed by the restore controller in order to
+determine which PVCs to create and mount in preparation for
+restore. Would the backup and restore plugins be different configured
+images, or would one image be used to handle both?
+
+The second option would be a larger golang image which would implement
+both the query functionality above and the backup/restore
+functionality.
+
 ## Data Mover as related to the Velero CSI Plugin
 
 Velero (and the Velero CSI plugin) will not be a requirement to use
@@ -62,7 +135,7 @@ with them.
 
 Open question: Do we need a separate StorageLocation CRD, or can that
 be merged into this Configuration resource?
-
+```
 apiVersion: oadp.openshift.io/v1alpha1
 kind: DataMoverConfig
 metadata:
@@ -81,6 +154,7 @@ spec:
   labelSelector:
     matchLabels:
       app: mysql
+```
 
 ### `DataMoverStorageLocation`
 
@@ -94,6 +168,10 @@ third data-mover-internal model. Regardless of the choice here, the
 metadata needs are approximately the same as the pre-existing Velero
 and CAM CRDs. In subsequent examples, `StorageLocation` is used as a
 stand-in for whatever is decided on here.
+
+Note: It's probably better *not* to attempt to reuse existing CAM or
+Velero CRDs here, since they won't have any custom fields for plugins
+which might need data not included in these external CRDs.
 
 ### `DataMoverVolumeBackup`
 
@@ -375,8 +453,8 @@ status:
 ## Data Mover Controller
 
 The Data Mover Controller is a long-running pod (implemented as a
-`Deployment`) which watches `VolumeSnapshot` and
-`DataMoverRestore` resources.
+`Deployment`) which watches `VolumeSnapshot`, `DataMoverVolumeBackup`,
+`DataMoverRestore`, and `DataMoverVolumeRestore` resources.
 
 TBD: The DataMoverVolumeBackup, DataMoverRestore, and
 DataMoverVolumeRestore CRs will have a status/phase field with a 
@@ -398,7 +476,10 @@ For each new `VolumeSnapshot`:
   - Find VolumeSnapshotContent based on Status.BoundVolumeSnapshotContentName
   - If snapshotContent.Status is empty or Status.SnapshotHandle is empty, keep waiting
   - Any other Status fields to check?
+- Create a `DataMoverVolumeBackup` with
+  appropriate owner references and metadata (see above section).
 
+For each new `DataMoverVolumeBackup`:
 - Create new PVC with VolumeSnapshot DataSource, using VolumeSnapshot
   from above
   - Find PVC via spec.VolumeSnapshotRef.
@@ -408,11 +489,6 @@ For each new `VolumeSnapshot`:
       get PVC metadata? name, namespace, size, StorageClass, AccessMode
   - request.Storage from source PVC Status.Capacity.Storage
   - StorageClassName from source PVC
-  - update `DataMoverBackup` `Status` with Spec PVC fields and
-    additional metadata to include in backup (storageClassName,
-    accessModes, storage)
-- Create a `DataMoverVolumeBackup` with
-  appropriate owner references and metadata (see above section).
 - Open Question: See above, related to supporting pre-provisioned snapshots?
 
 - Once the PVC is created, create a Deployment for a

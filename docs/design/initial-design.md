@@ -14,6 +14,79 @@ Data Mover combines the advantages of both approaches. In addition, it
 will allow an alternate Data Mover plugin to be used instead of the
 Restic plugin to meet additional user requirements.
 
+## High level design
+
+### Goals
+
+- Back up volumes with limited downtime
+- Provider-independent backup and restore (restore isn't limited to
+  same volume type as backup)
+- Make use of existing infrastructure for creating CSI snapshots
+  (velero, manual snapshot creation, other backup instrastructure)
+- Support plugins for different backup implementations
+- Backups stored outside of cluster (plugin-specific)
+- Does not require velero to be present
+
+### Approach
+
+1. Create a configuration which instructs DataMover to watch
+   VolumeSnapshots for a given criteria and where to copy the data.
+   - Storage location
+     - Should this be a reference to separate StorageLocation CRD
+       (which would allow reuse), or should it just be fields on the
+       Data Mover configuration?
+   - VolumeSnapshot (CSI snapshots) selection criteria for backing up
+     - Back up everything
+     - Everything in a list of namespaces
+     - Label selectors
+2. For a matched VolumeSnapshot, create a new PV/PVC that is initiated
+   from the referenced Snapshot
+3. Mount the PV in a Pod to handle the copying
+   - Assume the image the Pod runs is the 'backup plugin', perhaps a
+     simple contract of mount the PV at a given location and mount the
+     snapshot metadata at a specific file location in the container
+   - Communicate status/errors/progress via some method to be defined,
+     maybe the container sends a curl command to update status of a
+     specific CR for info
+4. To restore, create a Restore CR which references which volumes to
+   restore.
+   Open question: What methods of volume selection are supported?
+   - Specifying VolumeSnapshots (namespaced name? other key?)
+   - Specifying PVCs (namespaced name? Always use latest snapshot for
+     name?)
+   - Specifying namespaces (restore latest snapshot of each named PVC)
+   - Using LabelSelectors (latest snapshot of each matching PVC)
+   Open question: Do we support renaming PVCs and/or remapping
+   namespaces on restore? Other changes? (storageclass, size, etc.)
+5. Query the golang plugin to get a full list of matching
+   snapshots/PVCs to restore.
+6. For each returned backed-up PVC, create a new empty PV/PVC with the
+   appropriate namespace/name/size/etc. for restore.
+7. Mount the PV in a Pod to handle the copying
+   - Assume the image the Pod runs is the 'restore plugin'
+   - Communicate status/errors/progress via some method to be defined,
+     maybe the container sends a curl command to update status of a
+     specific CR for info
+
+### Plugin approach
+
+We have two basic options for the plugin approach, in terms of what
+sort of interface we will require/
+
+First, it could be a light weight interface that is essentially,
+Vendor provides an image and we will run it. We will mount a PV(s) to
+it and pass in needed info, otherwise it's up to vendor to do what
+they like and use any technology they like. This approach will require
+a small golang plugin on the restore side to implement a query
+interface which will be needed by the restore controller in order to
+determine which PVCs to create and mount in preparation for
+restore. Would the backup and restore plugins be different configured
+images, or would one image be used to handle both?
+
+The second option would be a larger golang image which would implement
+both the query functionality above and the backup/restore
+functionality.
+
 ## Data Mover as related to the Velero CSI Plugin
 
 Velero (and the Velero CSI plugin) will not be a requirement to use
@@ -40,7 +113,50 @@ Here is a summary of the actions taken by the Velero CSI plugin on backup:
 
 The following CRDs will be needed by the Data Mover:
 
-## `DataMoverStorageLocation`
+### `DataMoverConfig`
+
+This could be implemented as a ConfigMap instead of a separate
+configuration CRD. In the absence of an explicit Backup resource, this
+will contain configuration necessary to tell the DataMover how to back
+up VolumeSnapshots as they are created. This will need to be either a
+well-known default name/namespace, or the Data Mover Controller will
+need an environment variable with a reference. In addition to
+configuring the plugin and storage location, this resource will also
+contain the selection specification for VolumeSnapshots to back up --
+back up all snapshots, or by namespace, or by label, etc. There may be
+plugin-specific metadata needed as well, although that may be better
+placed in the StorageLocation.
+
+Since other plugins may require additional parameters, we may need a
+map-based `config` element as well. Parameters listed here that relate
+explicitly to PVC configuration can probably be kept as explicit CRD
+fields, though, since any data mover implementation will need to deal
+with them.
+
+Open question: Do we need a separate StorageLocation CRD, or can that
+be merged into this Configuration resource?
+```
+apiVersion: oadp.openshift.io/v1alpha1
+kind: DataMoverConfig
+metadata:
+  name: example-config
+  namespace: oadp-example
+spec:
+  storageLocationRef:
+    name: storage-example
+    namespace: oadp-example
+  plugin: restic # the restic reference plugin
+  config:
+    # plugin-specific metadata fields would go here.
+  includeAllSnapshots: false
+  namespaces:
+  - example-project
+  labelSelector:
+    matchLabels:
+      app: mysql
+```
+
+### `DataMoverStorageLocation`
 
 We need a way to model a storage location for PVC storage. The
 simplest thing to do here would be just to reuse either Velero's
@@ -53,86 +169,21 @@ metadata needs are approximately the same as the pre-existing Velero
 and CAM CRDs. In subsequent examples, `StorageLocation` is used as a
 stand-in for whatever is decided on here.
 
-### `DataMoverBackup`
-
-The `DataMoverBackup` is the resource created to initiate a Backup
-operation in the Data Mover controller. The main things that this must
-contain are a list of PVCs to back up and a `StorageLocation`
-reference.
-
-The main open question here is whether an explicit list of PVCs be the
-only way to identify what to back up.  Will we also allow a list of
-namespaces (including all PVCs in each namespace)? What about allowing
-the use of label selectors? If these alternate means are supported, do
-we support all 3 at once and take the union of the matches, or do we
-require that if one is specified the others are left blank?
-
-Since other plugins may require additional parameters, we may need a
-map-based `config` element as well. Parameters listed here that relate
-explicitly to PVC configuration can probably be kept as explicit CRD
-fields, though, since any data mover implementation will need to deal
-with them.
-
-Here is an example of a `DataMoverBackup` resource.
-
-```
-apiVersion: oadp.openshift.io/v1alpha1
-kind: DataMoverBackup
-metadata:
-  name: example-backup
-  namespace: oadp-example
-spec:
-  storageLocationRef:
-    name: storage-example
-    namespace: oadp-example
-  plugin: restic # the restic reference plugin
-  config:
-    # plugin-specific metadata fields would go here.
-  pvcs:
-  - name: mysql
-    namespace: mysql-persistent
-  - name: mysql2
-    namespace: mysql-persistent
-  namespaces:
-  - example-project
-  labelSelector:
-    matchLabels:
-      app: mysql
-status:
-  pvcs:
-  - originalPVC:
-      name: mysql
-      namespace: mysql-persistent
-    dataMoverPVC:
-      name: example-backup-q3e4q
-      namespace: mysql-persistent
-    storageClassName: csi-ceph
-    accessModes:
-    - ReadWriteMany
-    storage: 10Gi
-  - originalPVC:
-      name: mysql2
-      namespace: mysql-persistent
-    dataMoverPVC:
-      name: example-backup-6er3q
-      namespace: mysql-persistent
-    storageClassName: csi-ceph
-    accessModes:
-    - ReadWriteMany
-    storage: 10Gi
-  phase: Completed
-
-```
+Note: It's probably better *not* to attempt to reuse existing CAM or
+Velero CRDs here, since they won't have any custom fields for plugins
+which might need data not included in these external CRDs.
 
 ### `DataMoverVolumeBackup`
 
 The `DataMoverVolumeBackup` represents the backup operation for a
 single volume. This resource will be created by the Data Mover
-Controller, one for each volume being backed up in the
-`DataMoverBackup` operation. StorageClassName, AccessModes, and
-Storage are pulled from the original PVC (if not available, can this
-be inferred from the CSI snapshot? If not, figure out default -- in
-any case this matches what's used by the DataMoverPVC)
+Controller when it responds to a completed
+VolumeSnapshot. StorageClassName, AccessModes, and Storage are pulled
+from the original PVC.
+
+We also need to preserve VolumeSnapshot labels (also PVC labels?) and
+VolumeSnapshot creation time in plugin-accessible metadata, in
+addition to the namespaced names of originalPVC and volumeSnapshot
 
 ```
 apiVersion: oadp.openshift.io/v1alpha1
@@ -140,17 +191,17 @@ kind: DataMoverVolumeBackup
 metadata:
   name: example-backup-68b9q
   namespace: oadp-example
-    ownerReferences:
-    - apiVersion: oadp.openshift.io/v1alpha1
-      kind: DataMoverBackup
-      name: example-backup
-      uid: 2968fe09-aa94-11ea-85ad-0274cdd9b69e
+    ownerReferences: # should this reference the VolumeSnapshot, or
+                     #    should it be empty?
 spec:
+  volumeSnapshot:
+    name: mysql
+    namespace: mysql-persistent
   originalPVC:
     name: mysql
     namespace: mysql-persistent
   dataMoverPVC:
-    name: example-backup-q3e4q
+    name: mysql-q3e4q
     namespace: mysql-persistent
   storageClassName: csi-ceph
   accessModes:
@@ -164,32 +215,50 @@ status:
 ### `DataMoverRestore`
 
 The `DataMoverRestore` is the resource created to initiate a Restore
-operation in the Data Mover controller. The main things that this must
-contain are the `DataMoverBackup` name, a list of PVCs to restore and
-a `StorageLocation` reference.
+operation in the Data Mover controller. The main things this needs to
+contain is a StorageLocation reference and an identification of the
+PVCs/snapshots to restore. We should support multiple ways of
+identification.
 
-One open question is what form to provide the Backup reference. We
-can't assume that the `DataMoverBackup` resource will exist in the
-cluster, but we still need an identifying name to use to find the
-backups in the storage location. Whatever identifier is used here must
-be the same one used (possibly as a containing directory in the
-storage location) when backing up the volumes into object storage. We
-could use the Backup name, although this requires Backup names to be
-unique among all clusters using the same storage location. Reusing a
-name in a different cluster could result in data loss. Alternatively,
-we could use the uid from the `DataMoverBackup`, which should
-eliminate that problem. Whatever element is used to identify the
-backup is the one which would be specified here.
+Listing namespaces will restore every PVC in those namespaces:
+- Do we allow remapping of namespaces on restore?
+- If there are multiple snapshot backups for a PVC, with
+  namespace-level restore we take the latest.
 
-Also, regarding the PVCs to restore. Do we require an explicit list,
-or would an empty PVC list mean "restore all PVCs from the backup". An
-empty PVC list also means that the other per-PVC parameters will be
-the same as if the PVC list was included but the other parameters were
-omitted.
+Specify a label to restore. This will be similar to a labelSelector,
+but it won't actually be a label selector, since the backups are not
+kubernetes resources. When backing up VolumeSnapshots, VolumeSnapshot
+labels need to be accessible to the plugin.
+- Do we also allow labels set on the PVC prior to backing up, or
+  should the infrastructure that creates the VolumeSnapshot be
+  responsible for copying labels from PVC to VolumeSnapshot?
+- Will label-based restore allow for changing namespace or name? This
+  would be difficult to implement a reasonable API for this part.
+- If there are multiple snapshot backups for a PVC with the matching
+  we take the latest.
+- If there are multiple backups for a snapshot, with namespace-level
+  restore we take the latest.
 
-Another question: if a listed PVC matching `originalPVC` is not found
-in the referenced backup, is it ignored, listed with a warning, or an
-error which aborts the restore?
+Specify individual PVCs to restore by namespaced name.
+- Do we allow remapping of namespaces or names on restore? At this
+  level, it would be possible to allow it.
+- If there are multiple snapshot backups for a given PVC  we take the
+  latest. 
+
+Specify individual VolumeSnapshots to restore:
+- What key is indexed here? Namespaced name of VolumeSnapshot?
+  Something else?
+- Do we allow remapping of namespaces or names on restore? At this
+  level, it would be possible to allow it.
+- If there are multiple snapshot backups selected which map to a given
+  PVC (either using the prior namespaced name, or with remapping),
+  there is the potential for failure. Do we just ignore the second
+  one? Do we detect a clash and fail before attempting?
+
+General question: Can the StorageLocation reference be omitted if the
+DataMoverConfig StorageLocation is to be used? This goes away entirely
+if the StorageLocation is combined with DataMoverConfig (i.e. only one
+StorageLocation per cluster is supported)
 
 Since other plugins may require additional parameters, we may need a
 map-based `config` element as well. Parameters listed here that relate
@@ -212,6 +281,19 @@ per-PVC spec parameters
 When the DataMoverVolumeRestores are created, omitted values
 from the Spec field will be filled in with the from-backup defaults.
 
+Open question: Is the status.pvcs field below needed? Essentially it
+provides the full set of all snapshots/PVCs to restore. It will be the
+union of the following (if more than one match a given target
+namespaced name, the most recent is used):
+- all Snapshots in the namespaces listed
+- all Snapshots matching the label selector
+- latest snapshot for each pvc in Spec.Pvcs
+- all Snapshots listed in Spec.Snapshots
+
+For each of the above, the controller should create one
+DataMoverVolumeRestore. Status.Pvcs is a redundant bit of data, but it
+might help the controller if it's here as well.
+
 Here is an example of a `DataMoverRestore` resource.
 
 ```
@@ -224,12 +306,33 @@ spec:
   dataMoverBackup: example-backup
 # if UIDs are used:
 # dataMoverBackup: fbd0eeeb-6ea7-11ea-912c-0274cdd9b69e
+  # plugin might come from active DataMoverConfig
   plugin: restic # the restic reference plugin
   config:
     # plugin-specific metadata fields would go here.
+  # StorageLocation might come from active DataMoverConfig
   storageLocationRef:
     name: storage-example
     namespace: oadp-example
+  namespaces:
+  - example-project
+  labelSelector:
+    matchLabels:
+      app: mysql
+  snapshots: # instead of namespaced name, possibly other key?
+  - volumeSnapshot:
+      name: mysql-snapshot
+      namespace: mysql-persistent
+    targetPVC:
+      name: mysql3-moved
+      namespace: mysql-persistent
+    targetStorageClassName: csi-ceph
+    targetAccessModes:
+    - ReadWriteMany
+  - volumeSnapshot:
+      name: mysql-snapshot
+      namespace: mysql-persistent
+    targetStorage: 20Gi
   pvcs:
   - originalPVC:
       name: mysql
@@ -245,6 +348,33 @@ spec:
       namespace: mysql-persistent
     targetStorage: 20Gi
 status:
+  pvcs:
+  - volumeSnapshot:
+      name: mysql-snapshot
+      namespace: mysql-persistent
+    originalPVC:
+      name: mysql
+      namespace: mysql-persistent
+    targetPVC:
+      name: mysql-moved
+      namespace: mysql-persistent
+    targetStorageClassName: csi-ceph
+    targetAccessModes:
+    - ReadWriteMany
+    targetStorage: 20Gi
+  - volumeSnapshot:
+      name: mysql-snapshot
+      namespace: mysql-persistent
+    originalPVC:
+      name: mysql2
+      namespace: mysql-persistent
+    targetPVC:
+      name: mysql2
+      namespace: mysql-persistent
+    targetStorageClassName: csi-ceph
+    targetAccessModes:
+    - ReadWriteMany
+    targetStorage: 20Gi
   phase: Completed
 ```
 
@@ -272,6 +402,11 @@ metadata:
 spec:
   config:
     resticSnapshotId: b2493502 # plugin-specific
+    # if rsync-based, some plugin-defined identifier (possibly just
+    #    using something from the VolumeSnapshot originally)
+  volumeSnapshot: # instead of namespaced name, possibly other key?
+    name: mysql-snapshot
+    namespace: mysql-persistent
   originalPVC:
     name: mysql
     namespace: mysql-persistent
@@ -298,6 +433,9 @@ metadata:
 spec:
   config:
     resticSnapshotId: b249350a # plugin-specific
+  volumeSnapshot: # instead of namespaced name, possibly other key?
+    name: mysql-snapshot2
+    namespace: mysql-persistent
   originalPVC:
     name: mysql2
     namespace: mysql-persistent
@@ -315,154 +453,194 @@ status:
 ## Data Mover Controller
 
 The Data Mover Controller is a long-running pod (implemented as a
-`Deployment`) which watches `DataMoverBackup` and
-`DataMoverRestore` resources.
+`Deployment`) which watches `VolumeSnapshot`, `DataMoverVolumeBackup`,
+`DataMoverRestore`, and `DataMoverVolumeRestore` resources.
 
-TBD: The Backup and Restore CRs will have a status/phase field with a
+TBD: The DataMoverVolumeBackup, DataMoverRestore, and
+DataMoverVolumeRestore CRs will have a status/phase field with a 
 to-be-determined workflow. Possible states to deal with include:
 
 - New (might not be needed since once Status is no longer empty, we've
   moved beyond this status
 - Processing (sub-states? progress reporting?)
-- WaitingOnDataMoverActionController
-- DeletingPVCs (Backup only)
+- WaitingOnDataMoverActionController (Restore)
+- DeletingPVCs (VolumeBackup)
 - Completed
 - Failed (sub-states? FailedProcessing, FailedDataMoverActionController, etc.)
 
 ### Backups
 
-For each new `DataMoverBackup`:
-- For each PVC to be backed up, find a VolumeSnapshot
-  - If no snapshot, do we fail? skip? create one?
-  - If multiple snapshots, take most recent?
-  - Do we add an optional `VolumeSnapshot` parameter to the
-    `DataMoverBackup` PVC element to allow non-recent choices?
-  - If VolumeSnapshot found, wait for snapshot contents to be ready:
-    - If snapshot.Status is empty or Status.BoundVolumeSnapshotContentName is empty, keep waiting
-    - Find VolumeSnapshotContent based on Status.BoundVolumeSnapshotContentName
-    - If snapshotContent.Status is empty or Status.SnapshotHandle is empty, keep waiting
-    - Any other Status fields to check?
+For each new `VolumeSnapshot`:
+- Wait for snapshot contents to be ready:
+  - If snapshot.Status is empty or Status.BoundVolumeSnapshotContentName is empty, keep waiting
+  - Find VolumeSnapshotContent based on Status.BoundVolumeSnapshotContentName
+  - If snapshotContent.Status is empty or Status.SnapshotHandle is empty, keep waiting
+  - Any other Status fields to check?
+- Create a `DataMoverVolumeBackup` with
+  appropriate owner references and metadata (see above section).
 
-  - Create new PVC with VolumeSnapshot DataSource, using VolumeSnapshot from above
-    - request.Storage from source PVC Status.Capacity.Storage
-    - StorageClassName from source PVC
-    - update `DataMoverBackup` `Status` with Spec PVC fields and
-      additional metadata to include in backup (storageClassName,
-      accessModes, storage)
-  - For each new PVC, create a `DataMoverVolumeBackup` with
-    appropriate owner references and metadata (see above section).
-  - Open question: do we require source PVC to exist, or should we
-    allow an alternate method of specifying just a CSI snapshot? If
-    so, do we also need to require the user to specify
-    StorageClass, capcity, etc. or can that be inferred from the
-    CSI snapshot?
+For each new `DataMoverVolumeBackup`:
+- Create new PVC with VolumeSnapshot DataSource, using VolumeSnapshot
+  from above
+  - Find PVC via spec.VolumeSnapshotRef.
+    - For dynamically provisioned VolumeSnapshots this is required.
+    - For pre-provisioned snapshots, it is not. Do we support
+      pre-provisioned snapshots? If so, if there any reliable way to
+      get PVC metadata? name, namespace, size, StorageClass, AccessMode
+  - request.Storage from source PVC Status.Capacity.Storage
+  - StorageClassName from source PVC
+- Open Question: See above, related to supporting pre-provisioned snapshots?
 
-- Once the PVCs are created, create a Deployment for a
+- Once the PVC is created, create a Deployment for a
   DataMoverActionController, including a separate InitContainer for
   the selected data mover plugin:
   - Where is the line between Data Mover core and the plugin?
-  - New PVCs created above are all mounted in the
-    DataMoverActionController deployment
-  - `DataMoverBackup` reference will be passed to Deployment in the
-    DATA_MOVER_BACKUP environment variable.
+  - Will the plugin be a go container similar to velero storage
+    plugins which have several implemented API calls, all in go, or
+    will there be a small go plugin for queries only (mostly for
+    restore), and a separate binary only container where the API
+    consists of a CLI with arguments specified as environment variables?
+  - New PVC created above is mounted in the
+    DataMoverActionController (or vendor-supplied binary) deployment
+  - `DataMoverVolumeBackup` reference will be passed to Deployment in the
+    DATA_MOVER_BACKUP environment variable (or explicit args to vendor
+    binary set in TBD environment variable).
 
 ### Restores
 
 For each new `DataMoverRestore`:
+- Determine list of Snapshots/PVCs to restore. Plugin interface needs
+  to be generated to allow querying for a list of snapshots by:
+  - Namespace
+  - Label (foo="bar")
+  - VolumeSnapshot key (namespaced name, UID, or something else)
+  - PVC namespaced name
+  Plugin interface (either for the full vendor plugin, if implemented
+  in go, or for the more specialized vendor query plugin, if the
+  actual backup/restore is done via binary image) needs the following
+  API calls (note: if go plugin is limited to query interface, then
+  we'll use `DataMoverQuery` instead of `DataMoverPluginAction` for this):
+  ```
+  type DataMoverSnapshot struct {
+       # Stored at backup time. Either "what time the controller
+       # processed snapshot" or pulled from VolumeSnapshot
+       # creationTimestamp. Used for comparison to determine which
+       # snapshot to use if more than one are chosen for a given target PVC
+       CreationTimestamp metav1.Time        
+       VolumeSnapshot    NamespacedName // instead of of namespaced name, possibly other key?
+       PVC               NamespacedName
+       StorageClassName  string
+       AccessModes	 []PersistentVolumeAccessMode
+       # is status.Capacity sufficient, or do we need to store
+       # Spec.Request and Spec.Limit?
+       Storage		 resource.Quantity 
+  }
+  type DataMoverPluginAction interface {
+       FindByNamespace(namespace string) (DataMoverSnapshot[], error)
+       # should we use an actual LabelSelector or just a key/value pair?
+       FindByLabel(labelKey, labelValue string) (DataMoverSnapshot[], error)
+       FindBySnapshot(namespace, name string) (DataMoverSnapshot[], error)
+       FindByPVC(namespace, name string) (DataMoverSnapshot[], error)
+  }
+  ```
+  From the above calls, we need to merge the list so that only one
+  snapshot (the one with the latest CreationTimestamp) will be
+  restored for each targetPVC namespaced name.  
 - For each PVC to be restored:
+  - Update `DataMoverRestore.Status` with appropriate metadata
   - Create new PVC using Namespace, Name, Storageclass, size,
-    AccessMode from DataMoverRestore
+    AccessMode from output above
   - Create `DataMoverVolumeRestore` with appropriate fields (see above
     CRD section).
 
 - Once the empty PVCs are created, create a Deployment for a
   - DataMoverActionController, including a separate InitContainer for
-  - the selected data mover plugin
-  - New PVCs created above are all mounted in the deployment
+    the selected data mover plugin
+  - See above on the open question of whether this is a go plugin or a
+    binary image with args in env vars
+  - Open question 2: One deployment per `DataMoverVolumeRestore`
+    (i.e. one per volume) or one per `DataMoverRestore` (one for all
+    volumes)
+  - New PVCs created above are all mounted in the deployment (or one
+    per deployment)
   - `DataMoverRestore` reference will be passed to Deployment in the
-    DATA_MOVER_RESTORE environment variable.
+    DATA_MOVER_RESTORE environment variable (or all args via env vars).
 
 ## Data Mover Action Controller
 
-This is a short-lived Deployment created as a `Job` resource that's
-run once per `DataMoverBackup` or `DataMoverRestore` resource. We can
-probably use the same image for both operations, but it's still an
-open question. There's no reason we can't use separate images if it
-results in a cleaner implementation. The plugin will be included as an
-initContainer similar to Velero plugins. The Data Mover Controller
-will be responsible for launching and terminating this deployment as
-needed.
+This is a short-lived Deployment  that's
+run once per `DataMoverVolumeBackup` or `DataMoverRestore` (or
+`DataMoverVolumeRestore`) resource. We can probably use the same image
+for both operations. The main open question is whether this is a go
+plugin or whether it's vendor-supplied binary image that takes all
+required args via environment variables. If it's the former, then this
+Deployment will manage the
+DataMoverVolumeBackup/DataMoverVolumeRestore resources. If it's the
+latter, then we will need to determine the appropriate way for the
+DataMoverController to wait for output from the vendor binary and
+manage the DataMoverVolumeBackup/DataMoverVolumeRestore resources itself.
+The Data Mover Controller will be responsible for launching and
+terminating this deployment as needed.
 
 ### Backups
 
-A `DataMoverBackup` reference is passed into the pod via the
-DATA_MOVER_BACKUP environment variable. For the PVC referenced by each
-`DataMoverVolumeBackup` owned by the `DataMoverBackup` (all should be
-mounted), perform a backup using the plugin (restic in the reference
-implementation) from the mounted PVC into the referenced
-`StorageLocation`.
+A `VolumeSnapshot` reference is passed into the pod via the
+DATA_MOVER_VOLUME_BACKUP environment variable. For the PVC referenced
+by the `DataMoverVolumeBackup` (already mounted), perform a backup
+using the plugin (restic or rsync in the reference implementation)
+from the mounted PVC into the referenced
+`StorageLocation`. Alternately, pass all `DataMoverVolumeBackup`
+metadata to the binary image via environment variables. Method of
+return status is still TBD.
 
-#### Reference (restic) plugin backup
+#### Reference plugin backup
+
+For the reference plugin, we have the option of implementing using
+restic, or using rsync, or writing two reference plugins, one for
+each.
 
 The reference plugin will do the following:
-- Perform a restic backup
+- Perform a restic/rsync backup
 - Store appropriate per-PVC Status metadata into the
   `StorageLocation`:
+  - CreationTimestamp
+  - VolumeSnapshot namespaced name
   - Original PVC namespaced name
-  - PVC capacity
   - StorageClassName
-  - Restic Snapshot ID
+  - PVC access modes
+  - PVC capacity
+  - label k/v pairs
+  - Restic Snapshot ID (or appropriate identifier to be able to copy
+    back out via rsync)
 
-The metadata and all snapshots should be stored under a top level
-directory which uniquely identifies the `DataMoverBackup` (name, UID,
-etc.)
+The plugin must be able to query and identify lists of snapshots via
+VolumeSnapshot namespaced name, PVC namespaced name, namespace only
+(PVC? VolumeSnapshot? Will these always be the same?), or a label k/v
+pair. If more than one snapshot for a given PVC namespaced name match
+for a namespace or label query, should only the latest should
+returned, or should the DataMover controller filter that?)
+
+The plugin must be able to find the appropriate snapshot data for
+restore based on the VolumeSnapshot's namespaced name. If multiple
+Snapshots (sequentially) reuse the same namespaced name, newer ones
+will overwrite older ones. Is that OK? Do we need to use some other
+form of UID instead to identify the snapshot in all of our CRs instead
+of NamespacedName?
 
 ### Restores
 
 `DataMoverRestore` is passed into the pod via the DATA_MOVER_BACKUP
 environment variable. For the PVC referenced by each
 `DataMoverVolumeRestore` owned by the `DataMoverRestore` (all should
-be mounted), perform a restore using the plugin (restic in the
+be mounted), perform a restore using the plugin (restic or rsync in the
 reference implementation) from the the referenced `StorageLocation` to
-the mounted PVC.
+the mounted PVC. Alternately, pass all `DataMoverVolumeBackup`
+metadata to the binary image via environment variables. Method of
+return status is still TBD.
+Open question: One Deployment per PVC, or one deployment for all PVCs?
 
 ## Other Open issues to address:
 
-- Possible alternate design approach: Instead of watching for
-  `DataMoverBackup` resources, the Data Mover controller could watch
-  CSI snapshots instead. It depends on whether we want a
-  "backup-centric" approach, or a "PV/snapshot-centric" approach. The
-  explicit "back this up" approach allows the user to group PVCs and
-  explicitly call out storage locations. It also allows users to be
-  selective about which PVs get backed up into the defined
-  `StorageLocation`. The alternative would be to configure the
-  controller with a storage location to use for all snapshots, and
-  then back up one PVC at a time (for every PVC in the cluster for
-  which CSI snapshots are being taken) from the controller. This will
-  complicate restores, though, as there's no longer a backup ID to use
-  to pull volumes out to restore. We could key restores off namespaced
-  name of PVC, although this could be a problem with multiple clusters
-  (and multiple backups per PVC). We could key it off "PVC namespaced
-  name+source cluster ID", but I think this ultimately comes down to
-  what does the restore use case look like. Is it better for a user to
-  choose a backup operation and (optionally) backed-up volumes within
-  it, or is better to choose volumes by some other means and drop the
-  notion of a `DataMoverBackup` -- I assume we'll still need the
-  `DataMoverRestore`, but in the "no backup resource" case, the
-  restore would just take a list of "backed up volume"
-  references. This goes back to how we identify the backups at backup
-  time, and how we locate them at restore time. The other challenge is
-  the question of plugins. With an explicit `DataMoverBackup`
-  resource, the way of selecting PVCs for restore is plugin-agnostic,
-  but if the only artifact of backing up is what the plugin creates in
-  the `BackupLocation`, then we're relying on the actions of the
-  plugin for the definition of the identifier that the main controller
-  takes as an argument for restore. In any case, we have a few options
-  for this identifier:
-  - Namespaced name of PVC (doesn't account for multiple backups)
-  - Namespaced name of CSI snapshot
-￼ - UID of the above
-  - some combination
 - ceph/ocs API concerns: change block tracking, incremental
   snapshotting (if relevant). This may be outside the Data Mover scope
   if we assume snapshots already exist.
